@@ -5,10 +5,13 @@ from re import compile
 
 from django.conf import settings as django_settings
 from django.contrib.auth.views import redirect_to_login
+from django.http import HttpRequest
 from django.urls import reverse
 
 from django_auth_adfs.exceptions import MFARequired
 from django_auth_adfs.config import settings
+
+from asgiref.sync import iscoroutinefunction, markcoroutinefunction
 
 LOGIN_EXEMPT_URLS = [
     compile(django_settings.LOGIN_URL.lstrip('/')),
@@ -21,6 +24,8 @@ if hasattr(settings, 'LOGIN_EXEMPT_URLS'):
 
 
 class LoginRequiredMiddleware:
+    async_capable=True
+    sync_capable=True
     """
     Middleware that requires a user to be authenticated to view any page other
     than LOGIN_URL. Exemptions to this requirement can optionally be specified
@@ -32,8 +37,10 @@ class LoginRequiredMiddleware:
     """
     def __init__(self, get_response):
         self.get_response = get_response
+        if iscoroutinefunction(self.get_response):
+            markcoroutinefunction(self)
 
-    def __call__(self, request):
+    def __call__(self, request: HttpRequest):
         assert hasattr(request, 'user'), "The Login Required middleware requires " \
                                          "authentication middleware to be installed. " \
                                          "Edit your MIDDLEWARE setting to insert " \

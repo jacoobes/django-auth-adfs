@@ -1,5 +1,6 @@
 import base64
 import logging
+import httpx
 import warnings
 from datetime import datetime, timedelta
 from xml.etree import ElementTree
@@ -16,6 +17,9 @@ from django.core.exceptions import ImproperlyConfigured
 from django.http import QueryDict
 from django.shortcuts import render
 from django.utils.module_loading import import_string
+from contextlib import asynccontextmanager
+import httpx
+from httpx import Limits
 
 try:
     from django.urls import reverse
@@ -175,11 +179,12 @@ class Settings(object):
                                        "the CLAIM_MAPPING setting. Instead use the USERNAME_CLAIM setting.")
 
 
+
+
 class ProviderConfig(object):
     def __init__(self):
         self._config_timestamp = None
         self._mode = None
-
         self.authorization_endpoint = None
         self.signing_keys = None
         self.token_endpoint = None
@@ -205,7 +210,7 @@ class ProviderConfig(object):
         if hasattr(settings, "PROXIES"):
             self.session.proxies = settings.PROXIES
 
-    def load_config(self):
+    def load_config(self) -> None:
         # If loaded data is too old, reload it again
         refresh_time = datetime.now() - timedelta(hours=settings.CONFIG_RELOAD_INTERVAL)
         if self._config_timestamp is None or self._config_timestamp < refresh_time:
@@ -237,7 +242,7 @@ class ProviderConfig(object):
             logger.info("issuer:                 %s", self.issuer)
             logger.info("msgraph endpoint:       %s", self.msgraph_endpoint)
 
-    def _load_openid_config(self):
+    def _load_openid_config(self) -> bool:
         if settings.VERSION != 'v1.0':
             config_url = "https://{}/{}/{}/.well-known/openid-configuration?appid={}".format(
                 settings.SERVER, settings.TENANT_ID, settings.VERSION, settings.CLIENT_ID
@@ -368,7 +373,7 @@ class ProviderConfig(object):
 
         return "{0}?{1}".format(self.authorization_endpoint, query.urlencode())
 
-    def build_end_session_endpoint(self):
+    def build_end_session_endpoint(self) -> str:
         """
         This function returns the ADFS end session URL to log a user out.
 
@@ -380,6 +385,216 @@ class ProviderConfig(object):
         return self.end_session_endpoint
 
 
+
+## AsyncProviderConfig
+##
+class AsyncProviderConfig(object):
+    def __init__(self):
+        self._config_timestamp = None
+        self._mode = None
+        self.authorization_endpoint = None
+        self.signing_keys = None
+        self.token_endpoint = None
+        self.end_session_endpoint = None
+        self.issuer = None
+        self.msgraph_endpoint = None
+
+    async def redirect_uri(self,request):
+        await self.load_config()
+        return request.build_absolute_uri(reverse("django_auth_adfs:callback"))
+
+    async def build_end_session_endpoint(self) -> str:
+        """
+        This function returns the ADFS end session URL to log a user out.
+
+        Returns:
+            str: The redirect URI
+
+        """
+        await self.load_config()
+        return self.end_session_endpoint
+
+    async def build_authorization_endpoint(self, request, disable_sso=None, force_mfa=False):
+        """
+        This function returns the ADFS authorization URL.
+
+        Args:
+            request(django.http.request.HttpRequest): A django Request object
+            disable_sso(bool): Whether to disable single sign-on and force the ADFS server to show a login prompt.
+            force_mfa(bool): If MFA should be forced
+
+        Returns:
+            str: The redirect URI
+
+        """
+        await self.load_config()
+        if request.method == 'POST':
+            redirect_to = request.POST.get(REDIRECT_FIELD_NAME, None)
+        else:
+            redirect_to = request.GET.get(REDIRECT_FIELD_NAME, None)
+        if not redirect_to:
+            redirect_to = django_settings.LOGIN_REDIRECT_URL
+        redirect_to = base64.urlsafe_b64encode(redirect_to.encode()).decode()
+        query = QueryDict(mutable=True)
+        query.update({
+            "response_type": "code",
+            "client_id": settings.CLIENT_ID,
+            "resource": settings.RELYING_PARTY_ID,
+            "redirect_uri": await self.redirect_uri(request),
+            "state": redirect_to,
+        })
+        if self._mode == "openid_connect":
+            if settings.VERSION == 'v2.0':
+                if settings.SCOPES:
+                    query['scope'] = " ".join(settings.SCOPES)
+                else:
+                    query["scope"] = f"openid api://{settings.RELYING_PARTY_ID}/.default"
+                query.pop("resource")
+            else:
+                query["scope"] = "openid"
+            if (disable_sso is None and settings.DISABLE_SSO) or disable_sso is True:
+                query["prompt"] = "login"
+            if force_mfa:
+                query["amr_values"] = "ngcmfa"
+
+        return "{0}?{1}".format(self.authorization_endpoint, query.urlencode())
+
+    @asynccontextmanager
+    async def get_client(self):
+        transport = httpx.AsyncHTTPTransport(
+            # Retry configuration
+            retries=settings.RETRIES,
+            # Only retry on these HTTP methods
+            # SSL verification
+            verify=settings.CA_BUNDLE,
+
+            # Optional proxy configuration
+            proxy=settings.PROXIES if hasattr(settings, "PROXIES") else None,
+
+            # You might want to set some limits
+            limits=Limits(max_keepalive_connections=5, max_connections=10)
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            yield client
+
+    async def _load_openid_config(self):
+        async with self.get_client() as client:
+            if settings.VERSION != 'v1.0':
+                config_url = "https://{}/{}/{}/.well-known/openid-configuration?appid={}".format(
+                    settings.SERVER, settings.TENANT_ID, settings.VERSION, settings.CLIENT_ID
+                )
+            else:
+                config_url = "https://{}/{}/.well-known/openid-configuration?appid={}".format(
+                    settings.SERVER, settings.TENANT_ID, settings.CLIENT_ID
+                )
+
+            try:
+                logger.info("Trying to get OpenID Connect config from %s", config_url)
+                response = await client.get(config_url, timeout=settings.TIMEOUT)
+                response.raise_for_status()
+                openid_cfg = response.json()
+
+                response = await client.get(openid_cfg["jwks_uri"], timeout=settings.TIMEOUT)
+                response.raise_for_status()
+                signing_certificates = [x["x5c"][0] for x in response.json()["keys"] if x.get("use", "sig") == "sig"]
+                #                               ^^^
+                # https://tools.ietf.org/html/draft-ietf-jose-json-web-key-41#section-4.7
+                # The PKIX certificate containing the key value MUST be the first certificate
+            except requests.HTTPError:
+                raise ConfigLoadError
+            self._load_keys(signing_certificates)
+            try:
+                self.authorization_endpoint = openid_cfg["authorization_endpoint"]
+                self.token_endpoint = openid_cfg["token_endpoint"]
+                self.end_session_endpoint = openid_cfg["end_session_endpoint"]
+                if settings.TENANT_ID != 'adfs':
+                    self.issuer = openid_cfg["issuer"]
+                    self.msgraph_endpoint = openid_cfg["msgraph_host"]
+                else:
+                    self.issuer = openid_cfg["access_token_issuer"]
+                    self.msgraph_endpoint = "graph.microsoft.com"
+            except KeyError:
+                raise ConfigLoadError
+            return True
+
+    def _load_keys(self, certificates):
+        new_keys = []
+        for cert in certificates:
+            logger.debug("Loading public key from certificate: %s", cert)
+            cert_obj = load_der_x509_certificate(base64.b64decode(cert), backend)
+            new_keys.append(cert_obj.public_key())
+        self.signing_keys = new_keys
+
+    async def _load_federation_metadata(self):
+        async with self.get_client() as client:
+            server_url = "https://{}".format(settings.SERVER)
+            base_url = "{}/{}".format(server_url, settings.TENANT_ID)
+            if settings.TENANT_ID == "adfs":
+                adfs_config_url = server_url + "/FederationMetadata/2007-06/FederationMetadata.xml"
+            else:
+                adfs_config_url = base_url + "/FederationMetadata/2007-06/FederationMetadata.xml"
+
+            try:
+                logger.info("Trying to get ADFS Metadata file %s", adfs_config_url)
+                response = await client.get(adfs_config_url, timeout=settings.TIMEOUT)
+                response.raise_for_status()
+            except requests.HTTPError:
+                raise ConfigLoadError
+
+            # Extract token signing certificates
+            xml_tree = ElementTree.fromstring(response.content)
+            cert_nodes = xml_tree.findall(
+                "./{urn:oasis:names:tc:SAML:2.0:metadata}RoleDescriptor"
+                "[@{http://www.w3.org/2001/XMLSchema-instance}type='fed:SecurityTokenServiceType']"
+                "/{urn:oasis:names:tc:SAML:2.0:metadata}KeyDescriptor[@use='signing']"
+                "/{http://www.w3.org/2000/09/xmldsig#}KeyInfo"
+                "/{http://www.w3.org/2000/09/xmldsig#}X509Data"
+                "/{http://www.w3.org/2000/09/xmldsig#}X509Certificate")
+            signing_certificates = [node.text for node in cert_nodes]
+
+            self._load_keys(signing_certificates)
+            self.issuer = xml_tree.get("entityID")
+            self.authorization_endpoint = base_url + "/oauth2/authorize"
+            self.token_endpoint = base_url + "/oauth2/token"
+            self.end_session_endpoint = base_url + "/ls/?wa=wsignout1.0"
+            self.msgraph_endpoint = "graph.microsoft.com"
+            return True
+
+
+    async def load_config(self):
+        # If loaded data is too old, reload it again
+        refresh_time = datetime.now() - timedelta(hours=settings.CONFIG_RELOAD_INTERVAL)
+        if self._config_timestamp is None or self._config_timestamp < refresh_time:
+            logger.debug("Loading ID Provider configuration.")
+            try:
+                loaded = await self._load_openid_config()
+                self._mode = "openid_connect"
+            except ConfigLoadError:
+                loaded = await self._load_federation_metadata()
+                self._mode = "oauth2"
+
+            if not loaded:
+                if self._config_timestamp is None:
+                    msg = "Could not load any data from ADFS server. " \
+                          "Authentication against ADFS not be possible. " \
+                          "Verify your settings and the connection with the ADFS server."
+                    logger.critical(msg)
+                    raise RuntimeError(msg)
+                else:
+                    # We got data from the previous time. Log a message, but don't abort.
+                    logger.warning("Could not load any data from ADFS server. Keeping previous configurations")
+            self._config_timestamp = datetime.now()
+
+            logger.info("Loaded settings from ADFS server.")
+            logger.info("operating mode:         %s", self._mode)
+            logger.info("authorization endpoint: %s", self.authorization_endpoint)
+            logger.info("token endpoint:         %s", self.token_endpoint)
+            logger.info("end session endpoint:   %s", self.end_session_endpoint)
+            logger.info("issuer:                 %s", self.issuer)
+            logger.info("msgraph endpoint:       %s", self.msgraph_endpoint)
+
+
 settings_cls = _get_settings_class()
 settings = settings_cls()
 provider_config = ProviderConfig()
+aprovider_config = AsyncProviderConfig()

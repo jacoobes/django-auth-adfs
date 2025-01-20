@@ -10,9 +10,13 @@ from django.core.exceptions import (ImproperlyConfigured, ObjectDoesNotExist,
 from django_auth_adfs import signals
 from django_auth_adfs.config import provider_config, settings
 from django_auth_adfs.exceptions import MFARequired
+import httpx
+from httpx import Limits
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger("django_auth_adfs")
-
+class CoreAdfsBackend(ModelBackend):
+    pass
 
 class AdfsBaseBackend(ModelBackend):
 
@@ -401,6 +405,124 @@ class AdfsBaseBackend(ModelBackend):
             else:
                 msg = "User model has no field named '{}'. Check ADFS boolean claims mapping."
                 raise ImproperlyConfigured(msg.format(field))
+
+
+class AsyncAdfsAuthBackend(ModelBackend):
+    @asynccontextmanager
+    async def _get_client(self):
+        transport = httpx.AsyncHTTPTransport(
+            verify=settings.CA_BUNDLE,
+            proxy=settings.PROXIES if hasattr(settings, "PROXIES") else None,
+            limits=Limits(max_keepalive_connections=5, max_connections=10)
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport,
+            timeout=httpx.Timeout(settings.TIMEOUT),
+            limits=Limits(max_retries=settings.RETRIES)
+        ) as client:
+            yield client
+
+    async def _ms_request(self, method, url, data=None, **kwargs):
+        """
+        Make a Microsoft Entra/GraphQL request asynchronously
+
+        Args:
+            method (str): HTTP method ('get' or 'post')
+            url (str): The URL the request should be sent to.
+            data (dict): Optional dictionary of data to be sent in the request.
+
+        Returns:
+            response: The response from the server. If it's not a 200, a
+                      PermissionDenied is raised.
+        """
+        async with self._get_client() as client:
+            if method.lower() == 'post':
+                response = await client.post(url, data=data, **kwargs)
+            else:
+                response = await client.get(url, params=data, **kwargs)
+
+        if response.status_code == 400:
+            if response.json().get("error_description", "").startswith("AADSTS50076"):
+                raise MFARequired
+            logger.error("ADFS server returned an error: %s", response.json()["error_description"])
+            raise PermissionDenied
+
+        if response.status_code != 200:
+            logger.error("Unexpected ADFS response: %s", response.content.decode())
+            raise PermissionDenied
+        return response
+
+    async def exchange_auth_code(self, authorization_code, request):
+        logger.debug("Received authorization code: %s", authorization_code)
+        data = {
+            'grant_type': 'authorization_code',
+            'client_id': settings.CLIENT_ID,
+            'redirect_uri': provider_config.redirect_uri(request),
+            'code': authorization_code,
+        }
+        if settings.CLIENT_SECRET:
+            data['client_secret'] = settings.CLIENT_SECRET
+
+        logger.debug("Getting access token at: %s", provider_config.token_endpoint)
+        response = await self._ms_request('post', provider_config.token_endpoint, data)
+        adfs_response = response.json()
+        return adfs_response
+
+    async def get_obo_access_token(self, access_token):
+        """
+        Gets an On Behalf Of (OBO) access token asynchronously
+        """
+        logger.debug("Getting OBO access token: %s", provider_config.token_endpoint)
+        data = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "client_id": settings.CLIENT_ID,
+            "client_secret": settings.CLIENT_SECRET,
+            "assertion": access_token,
+            "requested_token_use": "on_behalf_of",
+        }
+        if provider_config.token_endpoint.endswith("/v2.0/token"):
+            data["scope"] = 'GroupMember.Read.All'
+        else:
+            data["resource"] = 'https://graph.microsoft.com'
+
+        response = await self._ms_request('get', provider_config.token_endpoint, data)
+        obo_access_token = response.json()["access_token"]
+        logger.debug("Received OBO access token: %s", obo_access_token)
+        return obo_access_token
+
+    def get_group_memberships_from_ms_graph_params(self):
+        """
+        Return the parameters to be used in the querystring
+        when fetching the user's group memberships.
+        """
+        return {}
+
+    async def get_group_memberships_from_ms_graph(self, obo_access_token):
+        """
+        Looks up a users group membership from the MS Graph API asynchronously
+        """
+        graph_url = "https://{}/v1.0/me/transitiveMemberOf/microsoft.graph.group".format(
+            provider_config.msgraph_endpoint
+        )
+        headers = {"Authorization": "Bearer {}".format(obo_access_token)}
+        response = await self._ms_request(
+            method='get',
+            url=graph_url,
+            data=self.get_group_memberships_from_ms_graph_params(),
+            headers=headers,
+        )
+        claim_groups = []
+        for group_data in response.json()["value"]:
+            if group_data["displayName"] is None:
+                logger.error(
+                    "The application does not have the required permission to read user groups from "
+                    "MS Graph (GroupMember.Read.All)"
+                )
+                raise PermissionDenied
+
+            claim_groups.append(group_data["displayName"])
+        return claim_groups
 
 
 class AdfsAuthCodeBackend(AdfsBaseBackend):
